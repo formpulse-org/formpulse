@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session as DBSession
 import jwt
+import re
+import base64
+from jwt import PyJWKClient
 
 from database import SessionLocal, Form, Session as SurveySession, Response, init_db
 import llm_provider
@@ -42,11 +45,14 @@ def get_db():
 security = HTTPBearer(auto_error=False)
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 
+_jwks_clients = {}
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
     Decodes the JWT bearer token sent by the frontend to verify the creator.
     If the JWT secret is not configured or in local SQLite fallback mode,
     it allows access for a default 'sandbox-user' creator.
+    Supports both HS256 (symmetric) and ES256 (asymmetric JWKS) token verification.
     """
     from database import IS_FALLBACK_SQLITE
     
@@ -57,28 +63,78 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
     token = credentials.credentials
     
-    if SUPABASE_JWT_SECRET:
+    try:
+        # Inspect the algorithm in the header without verification first
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg", "HS256")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token format: {e}")
+
+    if alg == "ES256":
         try:
-            payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+            # Parse supabase reference from database URL
+            db_url = os.getenv("SUPABASE_DATABASE_URL", "")
+            match = re.search(r"postgres\.([a-z0-9]+)", db_url)
+            if not match:
+                raise Exception("Unable to parse Supabase reference from database URL")
+            
+            supabase_ref = match.group(1)
+            jwks_url = f"https://{supabase_ref}.supabase.co/auth/v1/.well-known/jwks.json"
+            
+            if jwks_url not in _jwks_clients:
+                _jwks_clients[jwks_url] = PyJWKClient(jwks_url)
+                
+            jwks_client = _jwks_clients[jwks_url]
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            
+            payload = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["ES256"],
+                options={"verify_aud": False}
+            )
+            
             user_id = payload.get("sub")
             if not user_id:
                 raise HTTPException(status_code=401, detail="Invalid token subject")
             return user_id
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
-        except jwt.InvalidTokenError as e:
+        except Exception as e:
             if IS_FALLBACK_SQLITE:
                 return "sandbox-user"
             raise HTTPException(status_code=401, detail=f"Invalid authentication token: {e}")
-    else:
-        if IS_FALLBACK_SQLITE:
+            
+    else: # HS256 fallback
+        if SUPABASE_JWT_SECRET:
             try:
-                # Decode without verification for offline development
-                payload = jwt.decode(token, options={"verify_signature": False})
-                return payload.get("sub", "sandbox-user")
-            except Exception:
-                return "sandbox-user"
-        raise HTTPException(status_code=401, detail="Supabase JWT secret is not configured in backend environment")
+                # Some Supabase secrets are base64-encoded, try decoding if it ends with '=' or is length 88
+                secret_key = SUPABASE_JWT_SECRET
+                if len(secret_key) == 88 and secret_key.endswith("="):
+                    try:
+                        secret_key = base64.b64decode(secret_key)
+                    except Exception:
+                        pass
+                
+                payload = jwt.decode(token, secret_key, algorithms=["HS256"], options={"verify_aud": False})
+                user_id = payload.get("sub")
+                if not user_id:
+                    raise HTTPException(status_code=401, detail="Invalid token subject")
+                return user_id
+            except jwt.ExpiredSignatureError:
+                raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+            except jwt.InvalidTokenError as e:
+                if IS_FALLBACK_SQLITE:
+                    return "sandbox-user"
+                raise HTTPException(status_code=401, detail=f"Invalid authentication token: {e}")
+        else:
+            if IS_FALLBACK_SQLITE:
+                try:
+                    payload = jwt.decode(token, options={"verify_signature": False})
+                    return payload.get("sub", "sandbox-user")
+                except Exception:
+                    return "sandbox-user"
+            raise HTTPException(status_code=401, detail="Supabase JWT secret is not configured in backend environment")
 
 # -----------------
 # 0. ROOT ROUTE
