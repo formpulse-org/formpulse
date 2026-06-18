@@ -1,0 +1,689 @@
+import os
+import json
+import uuid
+import shutil
+from datetime import datetime
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form as FormParam
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session as DBSession
+import jwt
+
+from database import SessionLocal, Form, Session as SurveySession, Response, init_db
+import llm_provider
+import clustering
+
+# Create backend directories
+os.makedirs("uploads", exist_ok=True)
+
+# Initialize database
+init_db()
+
+app = FastAPI(title="FormPulse API", version="1.0")
+
+# CORS middleware for local Vercel/frontend communication
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# DB dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# JWT Token validation dependency
+security = HTTPBearer(auto_error=False)
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    """
+    Decodes the JWT bearer token sent by the frontend to verify the creator.
+    If the JWT secret is not configured or in local SQLite fallback mode,
+    it allows access for a default 'sandbox-user' creator.
+    """
+    from database import IS_FALLBACK_SQLITE
+    
+    if not credentials:
+        if IS_FALLBACK_SQLITE:
+            return "sandbox-user"
+        raise HTTPException(status_code=401, detail="Authentication credentials required")
+
+    token = credentials.credentials
+    
+    if SUPABASE_JWT_SECRET:
+        try:
+            payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+            user_id = payload.get("sub")
+            if not user_id:
+                raise HTTPException(status_code=401, detail="Invalid token subject")
+            return user_id
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+        except jwt.InvalidTokenError as e:
+            if IS_FALLBACK_SQLITE:
+                return "sandbox-user"
+            raise HTTPException(status_code=401, detail=f"Invalid authentication token: {e}")
+    else:
+        if IS_FALLBACK_SQLITE:
+            try:
+                # Decode without verification for offline development
+                payload = jwt.decode(token, options={"verify_signature": False})
+                return payload.get("sub", "sandbox-user")
+            except Exception:
+                return "sandbox-user"
+        raise HTTPException(status_code=401, detail="Supabase JWT secret is not configured in backend environment")
+
+# -----------------
+# 1. API STATUS & STATS
+# -----------------
+@app.get("/api/health")
+def health_check():
+    from database import IS_FALLBACK_SQLITE
+    return {
+        "status": "healthy",
+        "groq_configured": llm_provider.is_configured(),
+        "database_mode": "SQLite Fallback" if IS_FALLBACK_SQLITE else "Supabase PostgreSQL",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/api/stats")
+def get_global_stats(user_id: str = Depends(get_current_user), db: DBSession = Depends(get_db)):
+    """
+    Calculates overall real-time KPIs scoped to the authenticated creator.
+    """
+    total_forms = db.query(Form).filter(Form.user_id == user_id).count()
+    total_sessions = db.query(SurveySession).join(Form).filter(Form.user_id == user_id).count()
+    total_completed = db.query(Response).join(Form).filter(Form.user_id == user_id).count()
+    
+    completion_rate = 0
+    dropoff_rate = 0
+    if total_sessions > 0:
+        completion_rate = round((total_completed / total_sessions) * 100)
+        dropoff_rate = round(((total_sessions - total_completed) / total_sessions) * 100)
+        
+    avg_duration_sec = 0.0
+    all_responses = db.query(Response).join(Form).filter(Form.user_id == user_id).all()
+    if total_completed > 0:
+        durations = []
+        for r in all_responses:
+            sess = db.query(SurveySession).filter(SurveySession.id == r.session_id).first()
+            if sess and r.submitted_at and sess.created_at:
+                diff = (r.submitted_at - sess.created_at).total_seconds()
+                if 0 < diff < 3600:
+                    durations.append(diff)
+        if durations:
+            avg_duration_sec = round(sum(durations) / len(durations), 1)
+
+    # 1. Calculate sentiment pulse
+    sentiment_counts = {"Positive": 0, "Neutral": 0, "Negative": 0}
+    for r in all_responses:
+        raw_history = json.loads(r.raw_chat)
+        user_msgs = [m["content"] for m in raw_history if m["role"] == "user"]
+        full_user_text = " | ".join(user_msgs) if user_msgs else ""
+        sentiment = analyze_sentiment(full_user_text)
+        sentiment_counts[sentiment] = sentiment_counts.get(sentiment, 0) + 1
+
+    # 2. Get 5 most recent responses
+    recent_responses = []
+    latest_db_responses = db.query(Response).join(Form).filter(Form.user_id == user_id).order_by(Response.submitted_at.desc()).limit(5).all()
+    for r in latest_db_responses:
+        form = db.query(Form).filter(Form.id == r.form_id).first()
+        raw_history = json.loads(r.raw_chat)
+        user_msgs = [m["content"] for m in raw_history if m["role"] == "user"]
+        full_user_text = " | ".join(user_msgs) if user_msgs else "No dialogue"
+        sentiment = analyze_sentiment(full_user_text)
+        recent_responses.append({
+            "id": r.id,
+            "form_title": form.title if form else "Deleted Form",
+            "form_id": r.form_id,
+            "snippet": user_msgs[-1][:60] + "..." if user_msgs else "No messages",
+            "sentiment": sentiment,
+            "submitted_at": r.submitted_at.date().isoformat() if r.submitted_at else None
+        })
+        
+    return {
+        "totalForms": total_forms,
+        "totalSessions": total_sessions,
+        "totalCompleted": total_completed,
+        "completionRate": completion_rate,
+        "dropoffRate": dropoff_rate,
+        "avgDuration": avg_duration_sec,
+        "sentimentDistribution": sentiment_counts,
+        "recentResponses": recent_responses
+    }
+
+# -----------------
+# 2. FORM CREATION & CRUD
+# -----------------
+@app.post("/api/forms")
+def create_form(data: dict, user_id: str = Depends(get_current_user), db: DBSession = Depends(get_db)):
+    """
+    Creates a form.
+    Can accept a natural language "prompt" to auto-generate the form,
+    or a manual form configuration payload.
+    """
+    if "prompt" in data:
+        # Prompt-to-form generation
+        prompt = data["prompt"]
+        generated = llm_provider.generate_form_schema(prompt)
+        
+        # Enforce pacing planner agent on the generated schema
+        fields = generated.get("schema_fields", [])
+        title = generated.get("title", "AI Generated Form")
+        objective = generated.get("objective", "Extract parameters")
+        fields = llm_provider.plan_conversational_flow(title, objective, fields)
+        
+        # Save to database
+        new_form = Form(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            title=title,
+            objective=objective,
+            schema_fields=json.dumps(fields),
+            guardrails=json.dumps(generated.get("guardrails", {})),
+            settings=json.dumps(generated.get("settings", {}))
+        )
+    else:
+        # Manual configuration
+        title = data.get("title", "Untitled Form")
+        objective = data.get("objective", "General feedback collection")
+        fields = data.get("schema_fields", [])
+        
+        # Run pacing planner to add casual phrasing to manual fields
+        fields = llm_provider.plan_conversational_flow(title, objective, fields)
+        
+        new_form = Form(
+            id=data.get("id", str(uuid.uuid4())),
+            user_id=user_id,
+            title=title,
+            objective=objective,
+            schema_fields=json.dumps(fields),
+            guardrails=json.dumps(data.get("guardrails", {})),
+            settings=json.dumps(data.get("settings", {}))
+        )
+
+    db.add(new_form)
+    db.commit()
+    db.refresh(new_form)
+    return new_form.to_dict()
+
+@app.get("/api/forms")
+def list_forms(user_id: str = Depends(get_current_user), db: DBSession = Depends(get_db)):
+    forms = db.query(Form).filter(Form.user_id == user_id).all()
+    return [f.to_dict() for f in forms]
+
+@app.get("/api/forms/{form_id}")
+def get_form(form_id: str, user_id: str = Depends(get_current_user), db: DBSession = Depends(get_db)):
+    form = db.query(Form).filter(Form.id == form_id, Form.user_id == user_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+    return form.to_dict()
+
+@app.put("/api/forms/{form_id}")
+def update_form(form_id: str, data: dict, user_id: str = Depends(get_current_user), db: DBSession = Depends(get_db)):
+    form = db.query(Form).filter(Form.id == form_id, Form.user_id == user_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+
+    title = data.get("title", form.title)
+    objective = data.get("objective", form.objective)
+
+    if "title" in data:
+        form.title = title
+    if "objective" in data:
+        form.objective = objective
+    if "schema_fields" in data:
+        # Run conversation planner agent automatically on manual changes
+        fields = data["schema_fields"]
+        fields = llm_provider.plan_conversational_flow(title, objective, fields)
+        form.schema_fields = json.dumps(fields)
+    if "guardrails" in data:
+        form.guardrails = json.dumps(data["guardrails"])
+    if "settings" in data:
+        form.settings = json.dumps(data["settings"])
+
+    db.commit()
+    db.refresh(form)
+    return form.to_dict()
+
+@app.post("/api/forms/{form_id}/refine")
+def refine_form(form_id: str, data: dict, user_id: str = Depends(get_current_user), db: DBSession = Depends(get_db)):
+    """
+    Refines / updates an existing form config using AI reasoning without creating a duplicate.
+    """
+    form = db.query(Form).filter(Form.id == form_id, Form.user_id == user_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+
+    prompt = data.get("prompt", "")
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt is required")
+
+    current_schema = {
+        "title": form.title,
+        "objective": form.objective,
+        "schema_fields": json.loads(form.schema_fields),
+        "guardrails": json.loads(form.guardrails),
+        "settings": json.loads(form.settings)
+    }
+
+    refined = llm_provider.refine_form_schema(current_schema, prompt)
+    
+    title = refined.get("title", form.title)
+    objective = refined.get("objective", form.objective)
+    fields = refined.get("schema_fields", [])
+    
+    # Post-process refined fields to ensure pacing questions are set
+    fields = llm_provider.plan_conversational_flow(title, objective, fields)
+
+    form.title = title
+    form.objective = objective
+    form.schema_fields = json.dumps(fields)
+    form.guardrails = json.dumps(refined.get("guardrails", {}))
+    form.settings = json.dumps(refined.get("settings", {}))
+
+    db.commit()
+    db.refresh(form)
+    return form.to_dict()
+
+@app.delete("/api/forms/{form_id}")
+def delete_form(form_id: str, user_id: str = Depends(get_current_user), db: DBSession = Depends(get_db)):
+    form = db.query(Form).filter(Form.id == form_id, Form.user_id == user_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+    
+    db.delete(form)
+    db.commit()
+    return {"message": "Form deleted successfully"}
+
+# -----------------
+# 3. RESPONDENT SURVEY SESSIONS
+# -----------------
+@app.post("/api/sessions")
+def start_session(data: dict, db: DBSession = Depends(get_db)):
+    form_id = data.get("form_id")
+    form = db.query(Form).filter(Form.id == form_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+
+    form_dict = form.to_dict()
+    # Opening question generated conversationally by the AI agent to maintain flow and context
+    opening_message = llm_provider.generate_opening_question(form_dict)
+
+    new_session = SurveySession(
+        id=str(uuid.uuid4()),
+        form_id=form_id,
+        status="active",
+        conversation_history=json.dumps([
+            {"role": "assistant", "content": opening_message}
+        ]),
+        extracted_data=json.dumps({}),
+        fatigue_index=0.0
+    )
+
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
+    return new_session.to_dict()
+
+@app.get("/api/sessions/{session_id}")
+def get_session(session_id: str, db: DBSession = Depends(get_db)):
+    session = db.query(SurveySession).filter(SurveySession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session.to_dict()
+
+@app.post("/api/sessions/{session_id}/respond")
+async def respond_to_survey(
+    session_id: str,
+    message: str = FormParam(None),
+    audio: UploadFile = File(None),
+    db: DBSession = Depends(get_db)
+):
+    """
+    Submits a message (text or audio).
+    Fires the Groq conversation turn logic.
+    Updates session state and saves response to Responses if complete.
+    """
+    survey_session = db.query(SurveySession).filter(SurveySession.id == session_id).first()
+    if not survey_session:
+        raise HTTPException(status_code=404, detail="Survey session not found")
+
+    if survey_session.status != "active":
+        return {
+            "session": survey_session.to_dict(),
+            "form_complete": True,
+            "next_message": "This session is already complete. Thank you!"
+        }
+
+    form = db.query(Form).filter(Form.id == survey_session.form_id).first()
+    form_dict = form.to_dict()
+
+    # Process input (Text or Audio)
+    user_input = message
+    audio_transcription = None
+
+    if audio:
+        # Save temporary audio file
+        ext = audio.filename.split(".")[-1]
+        temp_filename = f"uploads/{session_id}_{uuid.uuid4().hex}.{ext}"
+        with open(temp_filename, "wb") as buffer:
+            shutil.copyfileobj(audio.file, buffer)
+        
+        # Transcribe audio using Groq Whisper
+        audio_transcription = llm_provider.transcribe_audio(temp_filename)
+        user_input = audio_transcription
+        
+        # Cleanup temp file
+        try:
+            os.remove(temp_filename)
+        except Exception:
+            pass
+
+    if not user_input or not user_input.strip():
+        raise HTTPException(status_code=400, detail="Empty text and audio parameters")
+
+    # Load states
+    history = json.loads(survey_session.conversation_history)
+    extracted = json.loads(survey_session.extracted_data)
+
+    # Process Turn with LLM
+    result = llm_provider.process_conversation_turn(form_dict, history, extracted, user_input)
+
+    # Calculate fatigue based on pacing/message details (Heuristic + LLM)
+    input_length = len(user_input.split())
+    # Fatigue index increases if inputs are too short or if LLM detects exhaustion
+    fatigue_delta = 0.05
+    if input_length < 3:
+        fatigue_delta = 0.15 # User is typing one word answers
+    if result.get("fatigue_rating") == "medium":
+        fatigue_delta = 0.2
+    elif result.get("fatigue_rating") == "high":
+        fatigue_delta = 0.4
+
+    new_fatigue = min(1.0, survey_session.fatigue_index + fatigue_delta)
+
+    # Check settings fatigue threshold
+    fatigue_threshold = form_dict.get("settings", {}).get("fatigue_threshold", 0.7)
+    form_complete = result.get("form_complete", False) or new_fatigue >= fatigue_threshold
+
+    # Format next message
+    next_msg = result.get("next_message", "Thank you.")
+    if new_fatigue >= fatigue_threshold and not form_complete:
+        next_msg = "I notice you might be busy or running out of time. Let me wrap things up here! Thank you so much for your thoughts."
+        form_complete = True
+
+    if form_complete:
+        # Programmatic guardrail to ensure the final message does NOT ask any questions.
+        import re
+        parts = re.split(r'([.!?])', next_msg)
+        reconstructed = []
+        current = ""
+        for part in parts:
+            if part in ['.', '!', '?']:
+                current += part
+                reconstructed.append(current.strip())
+                current = ""
+            else:
+                current += part
+        if current.strip():
+            reconstructed.append(current.strip())
+            
+        # Filter out any sentence that ends with a question mark
+        non_questions = [s for s in reconstructed if not s.endswith('?')]
+        if non_questions:
+            next_msg = " ".join(non_questions)
+        else:
+            next_msg = "Thanks so much for taking the time to share your feedback with us today!"
+            
+        if "thank" not in next_msg.lower():
+            next_msg += " Thank you for your time!"
+
+    # Update history
+    history.append({"role": "user", "content": user_input})
+    history.append({"role": "assistant", "content": next_msg})
+
+    # Update session in DB
+    survey_session.conversation_history = json.dumps(history)
+    survey_session.extracted_data = json.dumps(result.get("extracted_data", extracted))
+    survey_session.fatigue_index = new_fatigue
+
+    if form_complete:
+        survey_session.status = "completed"
+        # Save response in database
+        response = Response(
+            id=str(uuid.uuid4()),
+            form_id=form.id,
+            session_id=survey_session.id,
+            raw_chat=json.dumps(history),
+            extracted_data=json.dumps(result.get("extracted_data", extracted)),
+            fatigue_index=new_fatigue
+        )
+        db.add(response)
+
+    db.commit()
+    db.refresh(survey_session)
+
+    return {
+        "session": survey_session.to_dict(),
+        "form_complete": form_complete,
+        "next_message": next_msg,
+        "user_transcription": audio_transcription
+    }
+
+# -----------------
+# 4. ANALYTICS & VISUAL CLUSTERING
+# -----------------
+def analyze_sentiment(text: str) -> str:
+    """
+    Analyzes the sentiment of a text response using keyphrase matches.
+    Returns: 'Positive', 'Neutral', or 'Negative'
+    """
+    text_lower = text.lower()
+    
+    # Positive keyword triggers
+    pos_words = [
+        "good", "great", "awesome", "excellent", "perfect", "love", 
+        "satisfied", "happy", "easy", "fast", "helpful", "smooth", 
+        "wonderful", "best", "like", "impressed", "correct", "fine", "helpful"
+    ]
+    # Negative keyword triggers
+    neg_words = [
+        "bad", "slow", "lag", "bug", "expensive", "cost", "hate", 
+        "terrible", "worst", "pricey", "crashed", "friction", "pain", 
+        "annoying", "poor", "difficult", "hard", "confusing", "nuts",
+        "price", "overpriced", "billing", "charges", "unavailable"
+    ]
+    
+    pos_score = sum(text_lower.count(w) for w in pos_words)
+    neg_score = sum(text_lower.count(w) for w in neg_words)
+    
+    if pos_score > neg_score:
+        return "Positive"
+    elif neg_score > pos_score:
+        return "Negative"
+    else:
+        return "Neutral"
+
+@app.get("/api/forms/{form_id}/analytics")
+def get_form_analytics(form_id: str, db: DBSession = Depends(get_db)):
+    form = db.query(Form).filter(Form.id == form_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+
+    responses = db.query(Response).filter(Response.form_id == form_id).all()
+    sessions = db.query(SurveySession).filter(SurveySession.form_id == form_id).all()
+
+    total_sessions = len(sessions)
+    total_completed = len(responses)
+    completion_rate = round((total_completed / total_sessions * 100), 1) if total_sessions > 0 else 0.0
+
+    avg_fatigue = round(sum([r.fatigue_index for r in responses]) / total_completed, 2) if total_completed > 0 else 0.0
+
+    # Cluster response texts (we gather a main text block from each response)
+    clustering_inputs = []
+    for r in responses:
+        extracted = json.loads(r.extracted_data)
+        # Combine all text fields in extracted data as the cluster target
+        text_values = [str(v) for v in extracted.values() if isinstance(v, str) and len(v) > 3]
+        combined_text = " ".join(text_values)
+        if not combined_text:
+            # Fallback to last user message in chat
+            raw_history = json.loads(r.raw_chat)
+            user_msgs = [m["content"] for m in raw_history if m["role"] == "user"]
+            combined_text = user_msgs[-1] if user_msgs else ""
+        
+        clustering_inputs.append({
+            "id": r.id,
+            "text": combined_text
+        })
+
+    # Run clustering using TF-IDF and K-Means
+    cluster_results = clustering.analyze_and_cluster_responses(clustering_inputs)
+
+    # Outliers identification
+    outliers = cluster_results.get("outliers", [])
+    ml_outlier_ids = {o["response_id"] for o in outliers}
+
+    # Add heuristic outliers (words expressing strong frustration)
+    for r in responses:
+        if r.id in ml_outlier_ids:
+            continue
+        raw_history = json.loads(r.raw_chat)
+        user_msgs = " ".join([m["content"] for m in raw_history if m["role"] == "user"]).lower()
+        if any(w in user_msgs for w in ["lag", "bug", "slow", "error", "terrible", "worst", "hate"]):
+            outliers.append({
+                "response_id": r.id,
+                "text": user_msgs[:120] + "...",
+                "reason": "High friction language detected in responses",
+                "similarity": 1.0
+            })
+
+    # Pacing telemetry (mock metrics by mapping forms schema nodes)
+    form_dict = form.to_dict()
+    fields = form_dict["schema_fields"]
+    pacing_metrics = []
+    for f in fields:
+        # Mocking average latency (seconds) and drop-off rate per node
+        pacing_metrics.append({
+            "field": f["label"],
+            "avg_time_sec": round(15 + hash(f["id"]) % 10, 1),
+            "dropoff_rate": round((hash(f["id"]) % 15) / 100.0, 2)
+        })
+
+    # Group responses by day for time-series charts and compile text with sentiment
+    from collections import Counter
+    date_counts = Counter()
+    all_responses_data = []
+
+    for r in responses:
+        if r.submitted_at:
+            day_str = r.submitted_at.date().isoformat()
+            date_counts[day_str] += 1
+            
+        raw_history = json.loads(r.raw_chat)
+        user_msgs = [m["content"] for m in raw_history if m["role"] == "user"]
+        full_user_text = " | ".join(user_msgs) if user_msgs else "No verbal responses."
+        
+        sentiment = analyze_sentiment(full_user_text)
+        all_responses_data.append({
+            "id": r.id,
+            "full_text": full_user_text,
+            "sentiment": sentiment,
+            "raw_chat": raw_history,
+            "submitted_at": r.submitted_at.date().isoformat() if r.submitted_at else None
+        })
+
+    trend_series = [{"date": d, "count": c} for d, c in sorted(date_counts.items())]
+    if not trend_series:
+        trend_series = [{"date": datetime.utcnow().date().isoformat(), "count": 0}]
+
+    return {
+        "summary": {
+            "total_responses": total_completed,
+            "total_sessions": total_sessions,
+            "completion_rate_pct": completion_rate,
+            "avg_fatigue": avg_fatigue
+        },
+        "semantic_map": {
+            "points": cluster_results.get("points", []),
+            "clusters": cluster_results.get("clusters", [])
+        },
+        "pacing_telemetry": pacing_metrics,
+        "outliers": outliers[:10],
+        "historical_trends": trend_series,
+        "responses_list": all_responses_data
+    }
+
+# -----------------
+# 5. SYNTHETIC COHORT ROLEPLAY
+# -----------------
+@app.post("/api/forms/{form_id}/cohort-chat")
+def chat_with_cohort(form_id: str, data: dict, db: DBSession = Depends(get_db)):
+    """
+    Chats with a synthetic cohort persona.
+    Instructs the LLM to roleplay as a user representing the aggregated responses.
+    """
+    form = db.query(Form).filter(Form.id == form_id).first()
+    if not form:
+        raise HTTPException(status_code=404, detail="Form not found")
+
+    cohort_name = data.get("cohort_name", "General Cohort")
+    user_question = data.get("user_question", "")
+    chat_history = data.get("chat_history", [])
+
+    # Fetch responses to load context
+    responses = db.query(Response).filter(Response.form_id == form_id).all()
+    
+    # Filter or summarize responses to pass as context
+    response_summaries = []
+    for r in responses:
+        extracted = json.loads(r.extracted_data)
+        response_summaries.append(extracted)
+
+    response_context = json.dumps(response_summaries[:15], indent=2)
+
+    if not llm_provider.is_configured():
+        return {
+            "message": f"[SANDBOX MODE] As a member of the synthetic cohort '{cohort_name}', I think database speed syncs was the biggest bottleneck. If it worked 5x faster, I would not have churned."
+        }
+
+    # Structure prompt to roleplay
+    system_prompt = (
+        f"You are roleplaying as a synthetic user representing the customer cohort: '{cohort_name}'.\n"
+        "Your responses must reflect the aggregate feedback gathered from our survey.\n\n"
+        f"SURVEY OBJECTIVE:\n{form.objective}\n\n"
+        f"AGGREGATE SURVEY DATA (EXTRACTED VALUES):\n{response_context}\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Adopt the persona of a customer in this cohort (e.g. Price-Conscious Student or Frustrated Developer).\n"
+        "2. Answer the researcher's questions truthfully based on the aggregate feedback. Do NOT make up positive details that do not exist.\n"
+        "3. Keep your answers brief, candid, and conversational. Speak in first person ('I', 'we')."
+    )
+
+    # Format history
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in chat_history:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": user_question})
+
+    try:
+        completion = llm_provider.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.7
+        )
+        return {"message": completion.choices[0].message.content}
+    except Exception as e:
+        print(f"Error querying cohort chat: {e}")
+        return {"message": f"[Error: {e}]"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

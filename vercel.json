@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd frontend && npm install && npm run build",
+  "outputDirectory": "frontend/dist",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://your-backend-on-render.onrender.com/api/:path*"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/fill(.*)",
+      "dest": "/index.html"
+    },
+    {
+      "src": "/((?!api|assets|favicon).*)",
+      "dest": "/index.html"
+    }
+  ]
+}

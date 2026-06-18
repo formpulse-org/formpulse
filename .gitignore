@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+
+# Environment variables (NEVER commit secrets)
+.env
+backend/.env
+frontend/.env
+
+# Database files
+*.db
+formpulse.db
+
+# Build output
+frontend/dist/
+frontend/build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Upload artifacts
+backend/uploads/
+
+# Logs
+*.log
