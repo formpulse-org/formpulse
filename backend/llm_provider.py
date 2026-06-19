@@ -67,6 +67,37 @@ def _generate_mock_schema_from_prompt(prompt: str) -> dict:
             "pacing_question": "What tools or alternative databases are you considering migrating to?"
         })
 
+    # File, Picture, and URL mock prompts
+    if any(w in prompt_lower for w in ["photo", "picture", "image", "screenshot", "upload"]):
+        fields.append({
+            "id": "attached_screenshot",
+            "label": "Screenshot or Image attachment",
+            "type": "picture",
+            "required": False,
+            "description": "Uploaded image or screenshot detailing the issue",
+            "pacing_question": "If you have a screenshot or image of the issue, could you upload it here?"
+        })
+
+    if any(w in prompt_lower for w in ["file", "document", "pdf", "attachment"]):
+        fields.append({
+            "id": "attached_document",
+            "label": "Document or File attachment",
+            "type": "file",
+            "required": False,
+            "description": "Uploaded document or log file",
+            "pacing_question": "Could you share the relevant log file or document with us?"
+        })
+
+    if any(w in prompt_lower for w in ["url", "link", "website", "homepage"]):
+        fields.append({
+            "id": "website_url",
+            "label": "Website URL",
+            "type": "url",
+            "required": False,
+            "description": "Website or landing page address",
+            "pacing_question": "What is the link to your website or page?"
+        })
+
     # Check for custom words to build customized target fields if standard categories don't match
     words = [w.strip("?,.!:;()\"'") for w in prompt.split() if len(w) > 4 and w.lower() not in ["survey", "need", "identify", "details", "feedback", "cancel", "customer"]]
     
@@ -132,7 +163,7 @@ def generate_form_schema(prompt: str) -> dict:
         "    {\n"
         "      \"id\": \"unique_snake_case_id\",\n"
         "      \"label\": \"Human readable question label\",\n"
-        "      \"type\": \"text\" | \"number\" | \"choice\",\n"
+        "      \"type\": \"text\" | \"number\" | \"choice\" | \"url\" | \"picture\" | \"file\",\n"
         "      \"required\": true | false,\n"
         "      \"choices\": [\"Only if type is choice, list options\"] or null,\n"
         "      \"description\": \"What this field aims to capture\",\n"
@@ -189,7 +220,7 @@ def generate_form_schema_from_webpage(url: str, text_content: str, prompt: str =
         "    {\n"
         "      \"id\": \"unique_snake_case_id\",\n"
         "      \"label\": \"Human readable question label\",\n"
-        "      \"type\": \"text\" | \"number\" | \"choice\",\n"
+        "      \"type\": \"text\" | \"number\" | \"choice\" | \"url\" | \"picture\" | \"file\",\n"
         "      \"required\": true | false,\n"
         "      \"choices\": [\"Only if type is choice, list options\"] or null,\n"
         "      \"description\": \"What this field aims to capture\",\n"

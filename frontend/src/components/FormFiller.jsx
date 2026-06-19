@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, Square, Volume2, AlertCircle, RefreshCw } from 'lucide-react';
+import { Send, Mic, Square, Volume2, AlertCircle, RefreshCw, Paperclip } from 'lucide-react';
 
 export default function FormFiller({ formId, standalone = true, onSessionUpdate = null }) {
   const [session, setSession] = useState(null);
@@ -13,6 +13,10 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
   const [mediaRecorder, setMediaRecorder] = useState(null);
   const [audioChunks, setAudioChunks] = useState([]);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+
+  // File upload state
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const fileInputRef = useRef(null);
   
   const messagesEndRef = useRef(null);
   const timerRef = useRef(null);
@@ -80,18 +84,26 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
     await submitResponse(textToSend, null);
   };
 
-  const submitResponse = async (text, audioBlob) => {
+  const submitResponse = async (text, audioBlob, fileUrl = null, fileFieldId = null) => {
     setIsLoading(true);
     setError(null);
 
     // Optimistically add user message to UI
-    const tempUserMsg = { role: 'user', content: text || "[Voice Note Uploading...]" };
+    let tempUserContent = text || "[Voice Note Uploading...]";
+    if (fileUrl) {
+      // Clean up the URL representation for the chat view
+      const filename = fileUrl.split('/').pop() || 'file';
+      tempUserContent = `📎 Attached File: ${filename}`;
+    }
+    const tempUserMsg = { role: 'user', content: tempUserContent };
     setMessages(prev => [...prev, tempUserMsg]);
 
     try {
       const formData = new FormData();
       if (text) formData.append('message', text);
       if (audioBlob) formData.append('audio', audioBlob, 'voice_note.webm');
+      if (fileUrl) formData.append('file_url', fileUrl);
+      if (fileFieldId) formData.append('file_field_id', fileFieldId);
 
       const response = await fetch(`/api/sessions/${session.id}/respond`, {
         method: 'POST',
@@ -112,6 +124,54 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
       setMessages(prev => prev.slice(0, -1));
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file || !session) return;
+
+    const activeField = session.active_field;
+    if (!activeField) return;
+
+    const isPic = activeField.type === 'picture';
+    if (isPic && !file.type.startsWith('image/')) {
+      alert("Please upload an image file (PNG, JPG, WEBP, GIF).");
+      return;
+    }
+
+    // proposed limits: 5MB for picture, 10MB for documents
+    const limitBytes = isPic ? 5 * 1024 * 1024 : 10 * 1024 * 1024;
+    if (file.size > limitBytes) {
+      alert(`File is too large. Maximum size is ${isPic ? '5MB' : '10MB'}.`);
+      return;
+    }
+
+    setUploadingFile(true);
+    setError(null);
+
+    try {
+      const uploadFormData = new FormData();
+      uploadFormData.append('file', file);
+
+      const response = await fetch(`/api/sessions/${session.id}/upload`, {
+        method: 'POST',
+        body: uploadFormData
+      });
+
+      if (!response.ok) throw new Error("Failed to upload file to storage.");
+
+      const data = await response.json();
+      const fileUrl = data.url;
+
+      // Submit file response to the session
+      await submitResponse(null, null, fileUrl, activeField.id);
+    } catch (err) {
+      console.error("Upload error:", err);
+      alert(`Upload failed: ${err.message || 'Server error'}`);
+    } finally {
+      setUploadingFile(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
@@ -209,6 +269,24 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
             Thinking...
           </div>
         )}
+        {uploadingFile && (
+          <div className="chat-bubble user" style={{ 
+            opacity: 0.75, 
+            display: 'inline-flex', 
+            gap: '0.4rem', 
+            alignItems: 'center', 
+            alignSelf: 'flex-end', 
+            background: 'var(--card-bg)', 
+            border: '1px solid var(--card-border)', 
+            color: 'var(--text-primary)',
+            fontSize: '0.82rem',
+            padding: '0.5rem 1.25rem',
+            borderRadius: '12px 12px 0 12px'
+          }}>
+            <span className="loader-dot" style={{ animation: 'bounce 0.6s infinite alternate' }}>•</span>
+            Uploading attachment...
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
 
@@ -216,10 +294,44 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
       <div style={{ borderTop: '1px solid var(--card-border)', padding: '1rem', background: 'var(--card-bg)' }}>
         {isCompleted ? (
           <div style={{ textAlign: 'center', padding: '1rem', color: 'var(--success)', fontWeight: 600 }}>
-            ✓ Response submitted. Thank you for your time!
+             ✓ Response submitted. Thank you for your time!
           </div>
         ) : (
           <form onSubmit={handleSendText} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+            {/* Hidden native file input picker */}
+            <input 
+              type="file" 
+              ref={fileInputRef} 
+              onChange={handleFileUpload} 
+              style={{ display: 'none' }} 
+              accept={session?.active_field?.type === 'picture' ? 'image/*' : '*'}
+            />
+
+            {/* Paperclip attachment button for pictures and documents */}
+            {session?.active_field && (session.active_field.type === 'picture' || session.active_field.type === 'file') && (
+              <button 
+                type="button" 
+                className="button-icon"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading || uploadingFile || isRecording}
+                title={`Upload ${session.active_field.type === 'picture' ? 'Image' : 'File'}`}
+                style={{ 
+                  border: '1px solid var(--card-border)', 
+                  width: '38px', 
+                  height: '38px', 
+                  borderRadius: '50%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'var(--text-primary)',
+                  background: 'transparent',
+                  cursor: 'pointer'
+                }}
+              >
+                <Paperclip size={18} />
+              </button>
+            )}
+
             {isRecording ? (
               <div style={{ 
                 flex: 1, 
@@ -250,10 +362,10 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
               <input 
                 type="text" 
                 className="input-field" 
-                placeholder="Type your message..."
+                placeholder={session?.active_field?.type === 'url' ? "Please provide a website link..." : "Type your message..."}
                 value={inputText}
                 onChange={e => setInputText(e.target.value)}
-                disabled={isLoading}
+                disabled={isLoading || uploadingFile}
                 style={{ borderRadius: '20px', padding: '0.5rem 1.25rem' }}
               />
             )}

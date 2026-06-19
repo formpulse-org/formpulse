@@ -28,6 +28,9 @@ Thumbs.db
 
 # Upload artifacts
 backend/uploads/
+uploads/
 
 # Logs
 *.log
+
+.vercel

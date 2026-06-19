@@ -6,6 +6,7 @@ from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form as FormParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session as DBSession
 import jwt
 import re
@@ -25,6 +26,9 @@ os.makedirs("uploads", exist_ok=True)
 init_db()
 
 app = FastAPI(title="FormPulse API", version="1.0")
+
+# Mount uploads folder statically for zero-config file serving
+app.mount("/api/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS middleware for local Vercel/frontend communication
 app.add_middleware(
@@ -443,6 +447,24 @@ def delete_form(form_id: str, user_id: str = Depends(get_current_user), db: DBSe
 # -----------------
 # 3. RESPONDENT SURVEY SESSIONS
 # -----------------
+def get_active_field(form_dict: dict, extracted_data: dict) -> dict:
+    """
+    Looks at the form schema and identifies the next unextracted field.
+    Returns the field schema details (id, label, type, etc.) or None if complete.
+    """
+    fields = form_dict.get("schema_fields", [])
+    for f in fields:
+        if f["id"] not in extracted_data:
+            return {
+                "id": f["id"],
+                "label": f["label"],
+                "type": f.get("type", "text"),
+                "required": f.get("required", False),
+                "choices": f.get("choices"),
+                "description": f.get("description", "")
+            }
+    return None
+
 @app.post("/api/sessions")
 def start_session(data: dict, db: DBSession = Depends(get_db)):
     form_id = data.get("form_id")
@@ -468,7 +490,74 @@ def start_session(data: dict, db: DBSession = Depends(get_db)):
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
-    return new_session.to_dict()
+    
+    session_data = new_session.to_dict()
+    session_data["active_field"] = get_active_field(form_dict, {})
+    return session_data
+
+@app.post("/api/sessions/{session_id}/upload")
+async def upload_file(
+    session_id: str,
+    file: UploadFile = File(...),
+    db: DBSession = Depends(get_db)
+):
+    """
+    Handles uploads during a survey session.
+    First tries uploading to the platform owner's central Supabase Storage bucket (formpulse-uploads).
+    Falls back to local disk storage if credentials are missing or if upload fails.
+    """
+    survey_session = db.query(SurveySession).filter(SurveySession.id == session_id).first()
+    if not survey_session:
+        raise HTTPException(status_code=404, detail="Survey session not found")
+
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_anon_key = os.getenv("SUPABASE_ANON_KEY", "")
+
+    # Sanitize and format filename
+    raw_filename = file.filename or "attachment"
+    filename_parts = raw_filename.split(".")
+    ext = filename_parts[-1].lower() if len(filename_parts) > 1 else "bin"
+    
+    unique_id = uuid.uuid4().hex[:8]
+    safe_filename = f"{session_id}_{unique_id}.{ext}"
+    safe_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_filename)
+
+    # 1. Supabase Storage Upload (Production-grade, central)
+    if supabase_url and supabase_anon_key:
+        try:
+            url = supabase_url.rstrip("/")
+            bucket = "formpulse-uploads"
+            upload_url = f"{url}/storage/v1/object/{bucket}/sessions/{session_id}/{safe_filename}"
+
+            headers = {
+                "Authorization": f"Bearer {supabase_anon_key}",
+                "ApiKey": supabase_anon_key,
+                "Content-Type": file.content_type or "application/octet-stream"
+            }
+
+            file_content = await file.read()
+            async with httpx.AsyncClient() as client_http:
+                response = await client_http.post(upload_url, content=file_content, headers=headers, timeout=20.0)
+                if response.status_code == 200:
+                    public_url = f"{url}/storage/v1/object/public/{bucket}/sessions/{session_id}/{safe_filename}"
+                    return {"url": public_url}
+                else:
+                    print(f"Supabase REST storage upload failed with status {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"Failed uploading to Supabase Storage: {e}")
+
+    # 2. Local File System Fallback (Zero-config/Development sandbox)
+    try:
+        local_path = os.path.join("uploads", safe_filename)
+        # Reset file cursor just in case it was read during Supabase attempt
+        await file.seek(0)
+        with open(local_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Local relative path served by FastAPI static mounting
+        return {"url": f"/api/uploads/{safe_filename}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Local storage fallback failed: {e}")
 
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: str, db: DBSession = Depends(get_db)):
@@ -482,6 +571,8 @@ async def respond_to_survey(
     session_id: str,
     message: str = FormParam(None),
     audio: UploadFile = File(None),
+    file_url: str = FormParam(None),
+    file_field_id: str = FormParam(None),
     db: DBSession = Depends(get_db)
 ):
     """
@@ -506,6 +597,9 @@ async def respond_to_survey(
     # Process input (Text or Audio)
     user_input = message
     audio_transcription = None
+
+    if not user_input and file_url:
+        user_input = "[Attached File]"
 
     if audio:
         # Save temporary audio file
@@ -541,6 +635,11 @@ async def respond_to_survey(
     # Load states
     history = json.loads(survey_session.conversation_history)
     extracted = json.loads(survey_session.extracted_data)
+
+    # Inject uploaded file/image URL directly into state if provided
+    if file_url and file_field_id:
+        extracted[file_field_id] = file_url
+        survey_session.extracted_data = json.dumps(extracted)
 
     # Process Turn with LLM
     result = llm_provider.process_conversation_turn(form_dict, history, extracted, user_input)
@@ -598,9 +697,15 @@ async def respond_to_survey(
     history.append({"role": "user", "content": user_input})
     history.append({"role": "assistant", "content": next_msg})
 
+    # Merge LLM results with the state to preserve programmatically injected values
+    llm_extracted = result.get("extracted_data", {})
+    if isinstance(llm_extracted, dict):
+        for k, v in llm_extracted.items():
+            extracted[k] = v
+
     # Update session in DB
     survey_session.conversation_history = json.dumps(history)
-    survey_session.extracted_data = json.dumps(result.get("extracted_data", extracted))
+    survey_session.extracted_data = json.dumps(extracted)
     survey_session.fatigue_index = new_fatigue
 
     if form_complete:
@@ -611,7 +716,7 @@ async def respond_to_survey(
             form_id=form.id,
             session_id=survey_session.id,
             raw_chat=json.dumps(history),
-            extracted_data=json.dumps(result.get("extracted_data", extracted)),
+            extracted_data=json.dumps(extracted),
             fatigue_index=new_fatigue
         )
         db.add(response)
@@ -619,8 +724,11 @@ async def respond_to_survey(
     db.commit()
     db.refresh(survey_session)
 
+    session_data = survey_session.to_dict()
+    session_data["active_field"] = get_active_field(form_dict, json.loads(survey_session.extracted_data))
+
     return {
-        "session": survey_session.to_dict(),
+        "session": session_data,
         "form_complete": form_complete,
         "next_message": next_msg,
         "user_transcription": audio_transcription
@@ -746,6 +854,7 @@ def get_form_analytics(form_id: str, user_id: str = Depends(get_current_user), d
             "full_text": full_user_text,
             "sentiment": sentiment,
             "raw_chat": raw_history,
+            "extracted_data": json.loads(r.extracted_data) if r.extracted_data else {},
             "submitted_at": r.submitted_at.date().isoformat() if r.submitted_at else None
         })
 

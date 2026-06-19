@@ -281,6 +281,9 @@ export default function AIWorkspace({ activeForm, selectForm, onNavigate, forms,
                       <option value="text">Free Text</option>
                       <option value="number">Numeric Range</option>
                       <option value="choice">Multiple Choice</option>
+                      <option value="url">Website URL</option>
+                      <option value="picture">Picture / Photo</option>
+                      <option value="file">Document File</option>
                     </select>
                   </div>
                 </div>

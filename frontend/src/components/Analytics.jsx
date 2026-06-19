@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   BarChart3, Brain, MessageSquare, AlertTriangle, 
   ArrowLeft, Users, RefreshCw, Send, ZoomIn, ZoomOut, Move, Activity,
-  Download
+  Download, ExternalLink, X
 } from 'lucide-react';
 
 // --- SUB-COMPONENT: High-Performance Canvas Scatter Plot ---
@@ -356,6 +356,9 @@ export default function Analytics({ activeForm, selectForm, onNavigate, forms, a
   const [analyticsData, setAnalyticsData] = useState(null);
   const [activeSentimentTab, setActiveSentimentTab] = useState('All');
   const [expandedResponseId, setExpandedResponseId] = useState(null);
+  
+  // Lightbox view for image uploads
+  const [lightboxUrl, setLightboxUrl] = useState(null);
   
   // Synthetic Cohort Chat state
   const [selectedCohort, setSelectedCohort] = useState(null);
@@ -1094,6 +1097,74 @@ export default function Analytics({ activeForm, selectForm, onNavigate, forms, a
                         }}
                         onClick={e => e.stopPropagation()}
                       >
+                        {/* Extracted Structured Data Table */}
+                        {resp.extracted_data && Object.keys(resp.extracted_data).length > 0 && (
+                          <div style={{ marginBottom: '0.75rem', borderBottom: '1px solid var(--card-border)', paddingBottom: '1rem' }}>
+                            <strong style={{ fontSize: '0.78rem', color: 'var(--text-muted)', display: 'block', marginBottom: '0.5rem' }}>
+                              Extracted Survey Answers:
+                            </strong>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '0.75rem' }}>
+                              {(() => {
+                                const fields = activeForm.schema_fields ? (typeof activeForm.schema_fields === 'string' ? JSON.parse(activeForm.schema_fields) : activeForm.schema_fields) : [];
+                                return fields.map(field => {
+                                  const val = resp.extracted_data[field.id];
+                                  if (val === undefined || val === null || val === '') return null;
+                                  
+                                  return (
+                                    <div 
+                                      key={field.id} 
+                                      style={{ 
+                                        border: '1px solid var(--card-border)', 
+                                        background: 'var(--bg-color)', 
+                                        padding: '0.5rem 0.75rem', 
+                                        borderRadius: '6px' 
+                                      }}
+                                    >
+                                      <span style={{ display: 'block', fontSize: '0.68rem', color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.15rem' }}>
+                                        {field.label}
+                                      </span>
+                                      <div style={{ fontSize: '0.8rem', color: 'var(--text-primary)', fontWeight: 500 }}>
+                                        {field.type === 'url' ? (
+                                          <a 
+                                            href={val.startsWith('http') ? val : `https://${val}`} 
+                                            target="_blank" 
+                                            rel="noopener noreferrer" 
+                                            style={{ color: 'var(--accent-color)', textDecoration: 'underline', display: 'inline-flex', alignItems: 'center', gap: '0.2rem' }}
+                                          >
+                                            {val}
+                                            <ExternalLink size={10} />
+                                          </a>
+                                        ) : field.type === 'picture' ? (
+                                          <div style={{ marginTop: '0.25rem' }}>
+                                            <img 
+                                              src={val} 
+                                              alt={field.label} 
+                                              style={{ width: '60px', height: '45px', objectFit: 'cover', borderRadius: '4px', border: '1px solid var(--card-border)', cursor: 'pointer', display: 'block' }} 
+                                              onClick={() => setLightboxUrl(val)} 
+                                            />
+                                          </div>
+                                        ) : field.type === 'file' ? (
+                                          <a 
+                                            href={val} 
+                                            target="_blank" 
+                                            rel="noopener noreferrer" 
+                                            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', background: 'var(--card-bg)', border: '1px solid var(--card-border)', padding: '0.15rem 0.4rem', borderRadius: '4px', textDecoration: 'none', color: 'var(--text-primary)', fontSize: '0.72rem', marginTop: '0.25rem' }}
+                                          >
+                                            <Download size={10} />
+                                            View Document
+                                          </a>
+                                        ) : (
+                                          <span>{String(val)}</span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                });
+                              })()}
+                            </div>
+                          </div>
+                        )}
+                        
                         <strong style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Dialogue Transcript:</strong>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.50rem' }}>
                           {resp.raw_chat.map((msg, mIdx) => (
@@ -1131,6 +1202,41 @@ export default function Analytics({ activeForm, selectForm, onNavigate, forms, a
           )}
         </div>
       </div>
+
+      {/* Lightbox Image Overlay Modal */}
+      {lightboxUrl && (
+        <div 
+          className="modal-overlay" 
+          onClick={() => setLightboxUrl(null)} 
+          style={{ 
+            zIndex: 99999, 
+            display: 'flex', 
+            alignItems: 'center', 
+            justifyContent: 'center', 
+            backgroundColor: 'rgba(0,0,0,0.85)',
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0
+          }}
+        >
+          <div style={{ position: 'relative', maxWidth: '90vw', maxHeight: '90vh' }} onClick={e => e.stopPropagation()}>
+            <button 
+              className="button-icon" 
+              onClick={() => setLightboxUrl(null)} 
+              style={{ position: 'absolute', top: '-40px', right: '0px', color: '#ffffff', background: 'transparent', border: 'none', cursor: 'pointer' }}
+            >
+              <X size={24} />
+            </button>
+            <img 
+              src={lightboxUrl} 
+              alt="Enlarged Upload" 
+              style={{ maxWidth: '100%', maxHeight: '80vh', objectFit: 'contain', borderRadius: '8px', border: '1px solid var(--card-border)' }} 
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
