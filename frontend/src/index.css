@@ -1266,3 +1266,21 @@ body {
     color: #09090b !important;
   }
 }
+
+/* Form Filler Custom Branding & Accent Integration */
+.form-filler-container .chat-bubble.user {
+  background-color: var(--accent-color) !important;
+  color: #ffffff !important;
+}
+
+.form-filler-container .input-field:focus {
+  border-color: var(--accent-color) !important;
+  box-shadow: 0 0 0 2px var(--accent-glow) !important;
+}
+
+.form-filler-container .button-icon:hover {
+  color: var(--accent-color) !important;
+  background-color: var(--accent-glow) !important;
+  border-color: var(--accent-color) !important;
+}
+

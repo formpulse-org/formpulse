@@ -247,7 +247,7 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
   } : {};
 
   return (
-    <div style={{ 
+    <div className="form-filler-container" style={{ 
       display: 'flex', 
       flexDirection: 'column', 
       height: '100%', 
@@ -332,7 +332,7 @@ export default function FormFiller({ formId, standalone = true, onSessionUpdate 
             fontSize: '0.7rem', 
             padding: '0.25rem 0.6rem', 
             borderRadius: '12px',
-            background: 'rgba(37, 99, 235, 0.08)',
+            background: 'var(--accent-glow)',
             color: 'var(--accent-color)',
             fontWeight: 600
           }}>
