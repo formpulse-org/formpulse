@@ -1,33 +1,39 @@
 import os
 import httpx
 
-OPENWA_API_KEY = os.getenv("OPENWA_API_KEY", "formpulse_openwa_key")
-OPENWA_BASE_URL = os.getenv("OPENWA_BASE_URL", "http://localhost:2785/api")
+PICKY_ASSIST_TOKEN = os.getenv("PICKY_ASSIST_TOKEN", "")
+PICKY_ASSIST_APP_ID = os.getenv("PICKY_ASSIST_APP_ID", "1")
+PICKY_ASSIST_URL = "https://app.pickyassist.com/api/v2/push"
 
-def send_whatsapp_message(number: str, text: str):
+def send_whatsapp_message(number: str, text: str, session_id: str = "default"):
     """
-    Sends a WhatsApp message via local OpenWA Gateway.
+    Sends a WhatsApp message asynchronously via Picky Assist Push API.
     """
-    url = f"{OPENWA_BASE_URL}/sessions/default/messages/send-text"
-    
-    # Format number for WhatsApp
+    if not PICKY_ASSIST_TOKEN:
+        print("Warning: PICKY_ASSIST_TOKEN is not set.")
+        return None
+
+    # Format number for Picky Assist (Country code without +)
     clean_number = "".join(c for c in number if c.isdigit())
-    chat_id = f"{clean_number}@c.us"
 
     payload = {
-        "chatId": chat_id,
-        "text": text
-    }
-    
-    headers = {
-        "X-API-Key": OPENWA_API_KEY
+        "token": PICKY_ASSIST_TOKEN,
+        "application": PICKY_ASSIST_APP_ID,
+        "globalmessage": text,
+        "globalmedia": "",
+        "data": [
+            {
+                "number": clean_number,
+                "message": text
+            }
+        ]
     }
     
     try:
-        response = httpx.post(url, json=payload, headers=headers, timeout=10.0)
+        response = httpx.post(PICKY_ASSIST_URL, json=payload, timeout=15.0)
         response.raise_for_status()
-        print(f"WhatsApp message sent successfully via OpenWA to {clean_number}")
+        print(f"WhatsApp message sent successfully via Picky Assist to {clean_number}")
         return response.json()
     except Exception as e:
-        print(f"Failed to send WhatsApp message via OpenWA: {e}")
+        print(f"Failed to send WhatsApp message via Picky Assist: {e}")
         return None

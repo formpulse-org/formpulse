@@ -1,5 +1,6 @@
 import os
 import json
+import requests
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -13,8 +14,30 @@ client = None
 if api_key:
     client = Groq(api_key=api_key)
 
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "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")
+
 def is_configured():
     return client is not None
+
+def call_nvidia_fallback(messages: list, temperature: float = 0.2) -> str:
+    """Fallback to NVIDIA integrate API using moonshotai/kimi-k2.6 if Groq fails."""
+    invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Accept": "application/json"
+    }
+    payload = {
+        "model": "moonshotai/kimi-k2.6",
+        "messages": messages,
+        "max_tokens": 16384,
+        "temperature": temperature,
+        "top_p": 1.00,
+        "stream": False
+    }
+    
+    response = requests.post(invoke_url, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
 
 def _generate_mock_schema_from_prompt(prompt: str) -> dict:
     """
@@ -242,9 +265,18 @@ def generate_form_schema(prompt: str) -> dict:
         result = json.loads(completion.choices[0].message.content)
         return coerce_field_types(result)
     except Exception as e:
-        print(f"Error calling Groq for schema: {e}")
-        # Return fallback on error directly instead of recursive calls (fixes infinite recursion bug!)
-        return _generate_mock_schema_from_prompt(prompt)
+        print(f"Error calling Groq for schema: {e}. Falling back to NVIDIA...")
+        try:
+            fallback_content = call_nvidia_fallback([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Generate a form for this request: '{prompt}'"}
+            ])
+            result = json.loads(fallback_content)
+            return coerce_field_types(result)
+        except Exception as fallback_e:
+            print(f"NVIDIA fallback also failed: {fallback_e}")
+            # Return fallback on error directly instead of recursive calls (fixes infinite recursion bug!)
+            return _generate_mock_schema_from_prompt(prompt)
 
 def generate_form_schema_from_webpage(url: str, text_content: str, prompt: str = "") -> dict:
     """
@@ -304,8 +336,17 @@ def generate_form_schema_from_webpage(url: str, text_content: str, prompt: str =
         result = json.loads(completion.choices[0].message.content)
         return coerce_field_types(result)
     except Exception as e:
-        print(f"Error calling Groq for webpage schema: {e}")
-        return _generate_mock_schema_from_webpage(url, prompt)
+        print(f"Error calling Groq for webpage schema: {e}. Falling back to NVIDIA...")
+        try:
+            fallback_content = call_nvidia_fallback([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"URL: {url}\n\nWebpage text content:\n{text_content[:8000]}{user_prompt_clause}"}
+            ])
+            result = json.loads(fallback_content)
+            return coerce_field_types(result)
+        except Exception as fallback_e:
+            print(f"NVIDIA fallback also failed: {fallback_e}")
+            return _generate_mock_schema_from_webpage(url, prompt)
 
 def _generate_mock_schema_from_webpage(url: str, prompt: str = "") -> dict:
     # Extract domain name
@@ -478,14 +519,26 @@ def plan_conversational_flow(title: str, objective: str, fields: list) -> list:
             return result_fields
         return fields
     except Exception as e:
-        print(f"Error in plan_conversational_flow: {e}")
-        # Local mock generation fallback
-        for f in fields:
-            field_copy = dict(f)
-            if "pacing_question" not in field_copy or not field_copy["pacing_question"]:
-                field_copy["pacing_question"] = f"Could you tell me about: {field_copy['label']}?"
-            enriched_fields.append(field_copy)
-        return enriched_fields
+        print(f"Error in plan_conversational_flow: {e}. Falling back to NVIDIA...")
+        try:
+            fallback_content = call_nvidia_fallback([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Here is the form metadata and fields:\n{user_content}"}
+            ])
+            data = json.loads(fallback_content)
+            result_fields = data.get("fields", data.get("schema_fields", data))
+            if isinstance(result_fields, list):
+                return result_fields
+            return fields
+        except Exception as fallback_e:
+            print(f"NVIDIA fallback also failed: {fallback_e}")
+            # Local mock generation fallback
+            for f in fields:
+                field_copy = dict(f)
+                if "pacing_question" not in field_copy or not field_copy["pacing_question"]:
+                    field_copy["pacing_question"] = f"Could you tell me about: {field_copy['label']}?"
+                enriched_fields.append(field_copy)
+            return enriched_fields
 
 def process_conversation_turn(form_dict: dict, history: list, extracted_so_far: dict, latest_input: str, knowledge_context: str = "") -> dict:
     """
@@ -545,6 +598,7 @@ def process_conversation_turn(form_dict: dict, history: list, extracted_so_far: 
         "  - Use Empathetic Active Listening: Validate and acknowledge the user's input with brief conversational anchors, micro-expressions, or sentiment-based validation (e.g., 'I hear you, database setups are always tricky!' or 'Oh wow, database lag is the absolute worst'). Keep these validation anchors extremely short (one brief clause) so the conversation moves forward quickly without dragging.\n"
         "  - Use Dynamic Probing: If the user's answer to the active target field is too brief, vague, or mentions a major pain point (like a bug, database issue, or pricing friction) without any context, do NOT immediately move to the next field. Instead, ask exactly ONE spontaneous, brief follow-up question to probe for details (e.g., 'Oh no, where did you notice the lag most—during file uploads or loading the dashboard?').\n"
         "  - Avoid Dragging (ONE Follow-up Limit): Under NO circumstances ask more than ONE follow-up question for any single field. If the user has already responded to a follow-up sub-question (check the chat history to see if the last assistant message was a follow-up sub-question on the current field) or if they remain brief a second time, immediately extract whatever value you can and transition gracefully back to the main survey schema by asking the next field's pacing question. Do not badger the user or drag the topic further.\n"
+        "  - IMPORTANT CONSTRAINT: If the user asks you to elaborate, or deviates from the question, you are allowed to address their deviation or elaboration ONLY ONCE per question. After addressing it, you MUST immediately return to the main context and ask the current pacing question.\n"
         "  - Use Psychological Engagement: Formulate questions open-endedly and casually to make the user feel comfortable sharing more detail.\n"
         "  - Transitioning Fields: When the current field is sufficiently answered, move to the next unextracted target field. Look up its pre-planned 'pacing_question' property in the TARGET SCHEMA FIELDS and adapt this casual 'pacing_question' to prompt the user, rather than asking for the raw label directly. This is crucial to maintain flow.\n"
         "  - Keep sentences short, neat, and highly natural. Do NOT ask leading questions. Remain completely unbiased.\n"
@@ -571,8 +625,16 @@ def process_conversation_turn(form_dict: dict, history: list, extracted_so_far: 
         result = json.loads(completion.choices[0].message.content)
         return result
     except Exception as e:
-        print(f"Error calling Groq for chat turn: {e}")
-        return _mock_conversation_turn(form_dict, history, extracted_so_far, latest_input, knowledge_context)
+        print(f"Error calling Groq for chat turn: {e}. Falling back to NVIDIA...")
+        try:
+            fallback_content = call_nvidia_fallback([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Here is the dialogue history and the latest user input:\n{chat_history_str}"}
+            ], temperature=0.3)
+            return json.loads(fallback_content)
+        except Exception as fallback_e:
+            print(f"NVIDIA fallback also failed: {fallback_e}")
+            return _mock_conversation_turn(form_dict, history, extracted_so_far, latest_input, knowledge_context)
 
 def transcribe_audio(audio_file_path: str) -> str:
     """
@@ -756,8 +818,16 @@ def generate_opening_question(form_dict: dict) -> str:
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
-        print(f"Error generating opening question: {e}")
-        return f"Hey there! Thanks for taking a moment to chat. To start, {first_pacing[0].lower() + first_pacing[1:] if first_pacing else ''}"
+        print(f"Error generating opening question: {e}. Falling back to NVIDIA...")
+        try:
+            fallback_content = call_nvidia_fallback([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Generate the opening greeting and question."}
+            ], temperature=0.7)
+            return fallback_content.strip()
+        except Exception as fallback_e:
+            print(f"NVIDIA fallback also failed: {fallback_e}")
+            return f"Hey there! Thanks for taking a moment to chat. To start, {first_pacing[0].lower() + first_pacing[1:] if first_pacing else ''}"
 
 def refine_form_schema(current_schema: dict, prompt: str) -> dict:
     """
@@ -803,5 +873,14 @@ def refine_form_schema(current_schema: dict, prompt: str) -> dict:
         result = json.loads(completion.choices[0].message.content)
         return coerce_field_types(result)
     except Exception as e:
-        print(f"Error refining schema: {e}")
-        return current_schema
+        print(f"Error refining schema: {e}. Falling back to NVIDIA...")
+        try:
+            fallback_content = call_nvidia_fallback([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Refine the form schema based on this prompt: '{prompt}'"}
+            ])
+            result = json.loads(fallback_content)
+            return coerce_field_types(result)
+        except Exception as fallback_e:
+            print(f"NVIDIA fallback also failed: {fallback_e}")
+            return current_schema

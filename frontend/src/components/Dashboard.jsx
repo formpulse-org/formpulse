@@ -864,6 +864,32 @@ export default function Dashboard({ onNavigate, forms, setForms, selectForm, set
                 </div>
               </div>
 
+              {/* WhatsApp Share URL */}
+              <div style={{ width: '100%' }}>
+                <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>
+                  WhatsApp Native Survey Link (OpenWA)
+                </label>
+                <div className="share-url-container">
+                  <div className="share-url">{`https://api.whatsapp.com/send?text=${encodeURIComponent('start_survey_' + shareForm.id)}`}</div>
+                  <button 
+                    className="button-primary" 
+                    style={{ padding: '0.6rem 1rem' }}
+                    onClick={() => copyToClipboard(`https://api.whatsapp.com/send?text=${encodeURIComponent('start_survey_' + shareForm.id)}`, 'link')}
+                  >
+                    {copiedLink ? "Copied!" : <Copy size={16} />}
+                  </button>
+                  <a 
+                    href={`https://api.whatsapp.com/send?text=${encodeURIComponent('start_survey_' + shareForm.id)}`} 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="button-secondary" 
+                    style={{ padding: '0.6rem 1rem' }}
+                  >
+                    <ExternalLink size={16} />
+                  </a>
+                </div>
+              </div>
+
               {/* Embed Script code */}
               <div style={{ width: '100%' }}>
                 <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '0.35rem', fontWeight: 600 }}>

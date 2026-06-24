@@ -30,6 +30,39 @@ init_db()
 
 app = FastAPI(title="FormPulse API", version="1.0")
 
+import asyncio
+
+async def keep_awake_loop():
+    """Pings the external URLs every 10 minutes to prevent Render free tier sleep."""
+    import httpx
+    while True:
+        await asyncio.sleep(600)  # 10 minutes (Render sleeps after 15)
+        # Grab external URLs from env
+        backend_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
+        openwa_url = os.getenv("OPENWA_EXTERNAL_URL")
+        
+        # Fallback to OPENWA_API_URL if OPENWA_EXTERNAL_URL isn't explicitly set
+        if not openwa_url:
+            openwa_api = os.getenv("OPENWA_API_URL", "http://localhost:2785/api")
+            openwa_url = openwa_api.replace("/api", "")
+        
+        urls_to_ping = [f"{backend_url}/api/health"]
+        if openwa_url and "localhost" not in openwa_url:
+            urls_to_ping.append(openwa_url) # Pinging the root domain of OpenWA keeps it awake
+        
+        async with httpx.AsyncClient() as client:
+            for url in urls_to_ping:
+                try:
+                    await client.get(url, timeout=10.0)
+                    print(f"[Keep Awake] Pinged {url} successfully to prevent Render sleep.")
+                except Exception as e:
+                    print(f"[Keep Awake] Failed to ping {url}: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    # Launch the infinite loop in the background when FastAPI starts
+    asyncio.create_task(keep_awake_loop())
+
 # Mount uploads folder statically for zero-config file serving
 app.mount("/api/uploads", StaticFiles(directory="uploads"), name="uploads")
 
@@ -1064,74 +1097,81 @@ import urllib.parse
 @app.post("/api/webhooks/whatsapp")
 async def whatsapp_webhook(payload: dict, db: DBSession = Depends(get_db)):
     """
-    Receives incoming messages from WhatsApp via OpenWA Gateway.
+    Receives incoming messages from WhatsApp via Picky Assist Webhook.
     Routes to the correct SurveySession or initiates a new one via deep link.
     """
-    print(f"--- INCOMING OPENWA WEBHOOK ---\n{payload}\n-------------------------------------")
+    print(f"--- INCOMING PICKY ASSIST WEBHOOK ---\n{payload}\n-------------------------------------")
     try:
-        # OpenWA payload format
-        data = payload.get("data", {})
-        from_number = data.get("from", "")
+        # Picky Assist payload format
+        from_number = payload.get("number", "")
         if not from_number:
             return {"status": "ignored", "reason": "no_number"}
 
-        number = from_number.replace("@c.us", "")
-        user_message = data.get("body", "").strip()
+        # Extract number digits only
+        number = "".join(c for c in from_number if c.isdigit())
+        user_message = payload.get("message_in_raw", payload.get("message-in", "")).strip()
+        if not user_message and payload.get("message-in"):
+            user_message = urllib.parse.unquote(payload.get("message-in")).strip()
 
+        # Ignore outgoing messages (direction = 1 is outgoing, 0 is inbound)
+        if payload.get("direction") == 1:
+            return {"status": "ignored", "reason": "outgoing_message"}
+
+        import re
         # Is this an initialization deep link? (e.g. "start_survey_xxx")
-        if "start_survey_" in user_message.lower():
+        # Strictly enforce the format to ONLY accept exact matches to prevent accidental triggers
+        if re.match(r"^start_survey_[0-9a-fA-F\-]{36}$", user_message):
             # Extract form_id
-            parts = user_message.lower().split("start_survey_")
-            if len(parts) > 1:
-                form_id = parts[1].strip().split()[0] # get the id part
-                form = db.query(Form).filter(Form.id == form_id).first()
-                if form:
-                    # Create a new session. Encode the number in the ID to avoid schema migrations.
-                    session_id = f"wa_{number}_{uuid.uuid4().hex}"
-                    form_dict = {
-                        "id": form.id,
-                        "title": form.title,
-                        "objective": form.objective,
-                        "schema_fields": json.loads(form.schema_fields),
-                        "guardrails": json.loads(form.guardrails) if form.guardrails else {},
-                        "settings": json.loads(form.settings) if form.settings else {}
-                    }
-                    new_session = SurveySession(
-                        id=session_id,
-                        form_id=form_id,
-                        status="active",
-                        conversation_history=json.dumps([]),
-                        extracted_data=json.dumps({}),
-                        fatigue_index=0.0
-                    )
-                    db.add(new_session)
-                    
-                    # Generate opening question
-                    opening_msg = llm_provider.generate_opening_question(form_dict)
-                    
-                    # Save history
-                    history = [{"role": "assistant", "content": opening_msg}]
-                    new_session.conversation_history = json.dumps(history)
-                    db.commit()
+            form_id = user_message.replace("start_survey_", "").strip()
+            form = db.query(Form).filter(Form.id == form_id).first()
+            if form:
+                # Create a new session. Encode the number in the ID to avoid schema migrations.
+                survey_session_id = f"wa_{number}_{uuid.uuid4().hex}"
+                form_dict = {
+                    "id": form.id,
+                    "title": form.title,
+                    "objective": form.objective,
+                    "schema_fields": json.loads(form.schema_fields),
+                    "guardrails": json.loads(form.guardrails) if form.guardrails else {},
+                    "settings": json.loads(form.settings) if form.settings else {}
+                }
+                new_session = SurveySession(
+                    id=survey_session_id,
+                    form_id=form_id,
+                    status="active",
+                    conversation_history=json.dumps([]),
+                    extracted_data=json.dumps({}),
+                    fatigue_index=0.0
+                )
+                db.add(new_session)
+                
+                # Generate opening question
+                opening_msg = llm_provider.generate_opening_question(form_dict)
+                
+                # Save history
+                history = [{"role": "assistant", "content": opening_msg}]
+                new_session.conversation_history = json.dumps(history)
+                db.commit()
 
-                    # Send the opening message via WhatsApp
-                    whatsapp_provider.send_whatsapp_message(number, opening_msg)
-                    return {"status": "success", "action": "started_survey"}
-                else:
-                    whatsapp_provider.send_whatsapp_message(number, "Sorry, I couldn't find that survey. It might have been deleted.")
-                    return {"status": "error", "reason": "form_not_found"}
+                # Send immediately
+                whatsapp_provider.send_whatsapp_message(number, opening_msg)
+                return {"status": "ok", "message": "session_started"}
+            else:
+                whatsapp_provider.send_whatsapp_message(number, "Sorry, I couldn't find that survey. It might have been deleted.")
+                return {"status": "error", "message": "survey_not_found"}
 
         # If not an initiation, check if this number has an active survey session
-        # We query for the most recent active session containing this number in the ID
-        active_session = db.query(SurveySession).filter(
-            SurveySession.id.like(f"wa_{number}_%"),
-            SurveySession.status == "active"
+        # We query for the absolute most recent session containing this number in the ID
+        most_recent_session = db.query(SurveySession).filter(
+            SurveySession.id.like(f"wa_{number}_%")
         ).order_by(SurveySession.created_at.desc()).first()
 
-        if not active_session:
-            # They just sent a random message without starting a survey
-            whatsapp_provider.send_whatsapp_message(number, "Hello! You don't have any active surveys. Please click a survey link to begin.")
+        if not most_recent_session or most_recent_session.status != "active":
+            # They just sent a random message without an active survey, or their latest is completed
+            # We silently ignore it so the bot doesn't spam groups or random chats
             return {"status": "ignored", "reason": "no_active_session"}
+
+        active_session = most_recent_session
 
         # Process the conversation turn
         form = db.query(Form).filter(Form.id == active_session.form_id).first()
@@ -1188,10 +1228,10 @@ async def whatsapp_webhook(payload: dict, db: DBSession = Depends(get_db)):
 
         db.commit()
 
-        # Send response back to user
+        
+        # Send back to WhatsApp via Picky Assist
         whatsapp_provider.send_whatsapp_message(number, result["next_message"])
-
-        return {"status": "success", "action": "processed_turn"}
+        return {"status": "ok", "message": "replied"}
 
     except Exception as e:
         import traceback
