@@ -9,6 +9,10 @@ services:
         value: 3.11.0
       - key: GROQ_API_KEY
         sync: false # User will input their key in Render Dashboard
+      - key: PICKY_ASSIST_TOKEN
+        sync: false
+      - key: PICKY_ASSIST_APP_ID
+        value: "1"
     disk:
       name: sqlite-data
       mountPath: /data
