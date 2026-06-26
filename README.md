@@ -28,6 +28,8 @@ FormPulse is an enterprise-grade, multi-tenant survey platform designed to maxim
 * **Whisper Audio Ingestion:** Integrated audio voice note transcription using Groq Whisper-large-v3, allowing hands-free responses.
 * **Semantic Analysis & Clustering:** Automated TF-IDF vectorization and K-Means clustering organize text responses into distinct thematic cohorts, mapped dynamically in vector space.
 * **Synthetic Cohort Querying:** Interactive roleplay engine simulating aggregate feedback. Researchers can chat directly with AI representatives of specific user cohorts.
+* **Outbound Webhooks:** Real-time push integration allowing completed survey sessions and transcripts to be securely dispatched to external endpoints with HMAC SHA-256 signatures.
+* **Inline SDK Widget:** A lightweight, dependency-free JS SDK (`formpulse-widget.js`) to seamlessly embed the conversational surveyor inside external web applications via a sleek floating action button.
 * **Secure Multi-Tenancy:** Secure authentication utilizing Supabase Auth (OAuth / Google) with robust token validation supporting both symmetric HS256 and asymmetric ES256 JWKS verification schemes.
 * **SQLite Fallback Sandbox:** Local, zero-config sqlite execution mode for offline sandbox testing.
 
